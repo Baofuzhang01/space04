@@ -127,9 +127,35 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-test.json
 
-# Local scripts
+# ====================================================
+# 项目特定忽略
+# ====================================================
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 本地测试文件
+test.json
+test.py
+test_*.py
+
+# 本地脚本（不上传）
 switch_remote.py
-workers/
+auto_commit.sh
+
+# Cloudflare Workers 本地缓存
+workers/**/.wrangler/
+workers/**/node_modules/
+
+# 验证码调试目录
 captcha_debug/
+
+# 本地配置（包含敏感信息，示例配置保留）
+# config.json  # 如包含真实账号密码，取消此行注释

@@ -33,7 +33,7 @@ def _beijing_now() -> datetime.datetime:
     return datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
-from utils import reserve, get_user_credentials
+from utils import AES_Decrypt, reserve, get_user_credentials
 
 
 def _now(action: bool) -> datetime.datetime:
@@ -73,6 +73,77 @@ RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 # True：每一轮都会重新创建会话并登录（原有行为）；
 # False：每个账号只在第一次需要时登录一次，后续循环复用同一个会话。
 RELOGIN_EVERY_LOOP = True
+
+
+def _load_runtime_config(config_path, dispatch_mode, action):
+    if dispatch_mode:
+        payload_raw = os.environ.get("DISPATCH_PAYLOAD")
+        if not payload_raw:
+            raise ValueError("DISPATCH_PAYLOAD is required when --dispatch is enabled")
+
+        payload = json.loads(payload_raw)
+        username = payload.get("username")
+        password = payload.get("password")
+        roomid = payload.get("roomid")
+        seatid = payload.get("seatid")
+        times = payload.get("times")
+
+        if not all([username, password, roomid, seatid, times]):
+            raise ValueError("DISPATCH_PAYLOAD missing required fields")
+
+        decrypted_password = AES_Decrypt(password)
+        os.environ["CX_USERNAME"] = username
+        os.environ["CX_PASSWORD"] = decrypted_password
+
+        return {
+            "reserve": [
+                {
+                    "username": username,
+                    "password": decrypted_password,
+                    "times": times,
+                    "roomid": roomid,
+                    "seatid": seatid if isinstance(seatid, list) else [seatid],
+                    "seatPageId": payload.get("seatPageId") or "",
+                    "fidEnc": payload.get("fidEnc") or "",
+                    "daysofweek": [get_current_dayofweek(action)],
+                }
+            ],
+            "strategy": payload.get("strategy", {}),
+            "endtime": payload.get("endtime", ENDTIME),
+            "relogin_every_loop": False,
+        }
+
+    with open(config_path, "r+") as data:
+        return json.load(data)
+
+
+def _apply_strategy_config(config):
+    global ENDTIME
+    global RELOGIN_EVERY_LOOP
+    global STRATEGY_LOGIN_LEAD_SECONDS
+    global STRATEGY_SLIDER_LEAD_SECONDS
+    global STRATEGIC_MODE
+    global PRE_FETCH_TOKEN_MS
+    global FIRST_SUBMIT_OFFSET_MS
+    global TARGET_OFFSET2_MS
+    global TARGET_OFFSET3_MS
+    global SUBMIT_MODE
+    global BURST_OFFSETS_MS
+    global TOKEN_FETCH_DELAY_MS
+
+    strategy_cfg = config.get("strategy", {})
+    ENDTIME = config.get("endtime", ENDTIME)
+    STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 18))
+    STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
+    STRATEGIC_MODE = strategy_cfg.get("mode", "B")
+    PRE_FETCH_TOKEN_MS = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
+    FIRST_SUBMIT_OFFSET_MS = int(strategy_cfg.get("first_submit_offset_ms", 89))
+    TARGET_OFFSET2_MS = int(strategy_cfg.get("target_offset2_ms", 150))
+    TARGET_OFFSET3_MS = int(strategy_cfg.get("target_offset3_ms", 160))
+    SUBMIT_MODE = strategy_cfg.get("submit_mode", "serial")
+    BURST_OFFSETS_MS = strategy_cfg.get("burst_offsets_ms", [120, 420, 820])
+    TOKEN_FETCH_DELAY_MS = int(strategy_cfg.get("token_fetch_delay_ms", 50))
+    RELOGIN_EVERY_LOOP = bool(config.get("relogin_every_loop", RELOGIN_EVERY_LOOP))
 
 
 def _get_beijing_target_from_endtime() -> datetime.datetime:
@@ -845,49 +916,39 @@ if __name__ == "__main__":
         action="store_true",
         help="use --action to enable in github action",
     )
+    parser.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="load single-user config from DISPATCH_PAYLOAD",
+    )
     args = parser.parse_args()
     func_dict = {"reserve": main, "debug": debug, "room": get_roomid}
-    with open(args.user, "r+") as data:
-        config = json.load(data)
-        usersdata = config["reserve"]
+    config = _load_runtime_config(args.user, args.dispatch, args.action)
+    usersdata = config["reserve"]
 
-        # 从 config.json 读取所有策略参数（唯一配置来源）
-        # ┌─────────────────────────────────────────────────────────────────────┐
-        # │  mode (STRATEGIC_MODE) × submit_mode (SUBMIT_MODE) 四种组合         │
-        # ├──────────┬────────────┬──────────────────────────────────────────────┤
-        # │ mode=A   │ serial     │ T-pre_fetch_token_ms 预取token1              │
-        # │          │            │ → T+first_submit_offset_ms POST，等结果       │
-        # │          │            │ → 失败则现取token2，+offset2 POST，等结果      │
-        # │          │            │ → 失败则现取token3，+offset3 POST             │
-        # ├──────────┼────────────┼──────────────────────────────────────────────┤
-        # │ mode=A   │ burst ★   │ T-pre_fetch_token_ms 预取token1/2/3           │
-        # │          │            │ → T+burst[0] thread-1 直接POST（零GET延迟）   │
-        # │          │            │ → T+burst[1] thread-2 直接POST（零GET延迟）   │
-        # │          │            │ → T+burst[2] thread-3 直接POST（零GET延迟）   │
-        # ├──────────┼────────────┼──────────────────────────────────────────────┤
-        # │ mode=B   │ serial     │ T+first_submit_offset_ms 取token1并POST，等结果│
-        # │ (默认)   │ (默认)     │ → 失败则现取token2，+offset2 POST，等结果      │
-        # │          │            │ → 失败则现取token3，+offset3 POST             │
-        # ├──────────┼────────────┼──────────────────────────────────────────────┤
-        # │ mode=B   │ burst      │ T+burst[0] thread-1 自取token并POST           │
-        # │          │            │ T+burst[1] thread-2 自取token并POST           │
-        # │          │            │ T+burst[2] thread-3 自取token并POST           │
-        # │          │            │ 注意：实际POST = burst[i] + GET网络延迟        │
-        # └──────────┴────────────┴──────────────────────────────────────────────┘
-        strategy_cfg = config.get("strategy", {})
-        STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 18))
-        STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
-        STRATEGIC_MODE               = strategy_cfg.get("mode", "B")             # "A" | "B" | "C"
-        PRE_FETCH_TOKEN_MS           = int(strategy_cfg.get("pre_fetch_token_ms", 3000))   # 仅 mode=A
-        FIRST_SUBMIT_OFFSET_MS       = int(strategy_cfg.get("first_submit_offset_ms", 89)) # mode=A: 提交延迟; mode=B: 取token延迟
-        TARGET_OFFSET2_MS            = int(strategy_cfg.get("target_offset2_ms", 150))     # 仅 serial
-        TARGET_OFFSET3_MS            = int(strategy_cfg.get("target_offset3_ms", 160))     # 仅 serial
-        SUBMIT_MODE                  = strategy_cfg.get("submit_mode", "serial")  # "serial" | "burst"
-        BURST_OFFSETS_MS             = strategy_cfg.get("burst_offsets_ms", [120, 420, 820])  # 仅 burst
-        # mode=C 预热取 token 参数
-        TOKEN_FETCH_DELAY_MS         = int(strategy_cfg.get("token_fetch_delay_ms", 50))   # 目标时间后多少 ms 取 token
-
-        # 控制是否在每一轮主循环中都重新登录
-        RELOGIN_EVERY_LOOP = bool(config.get("relogin_every_loop", RELOGIN_EVERY_LOOP))
+    # 从配置读取策略参数。
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │  mode (STRATEGIC_MODE) × submit_mode (SUBMIT_MODE) 四种组合         │
+    # ├──────────┬────────────┬──────────────────────────────────────────────┤
+    # │ mode=A   │ serial     │ T-pre_fetch_token_ms 预取token1              │
+    # │          │            │ → T+first_submit_offset_ms POST，等结果       │
+    # │          │            │ → 失败则现取token2，+offset2 POST，等结果      │
+    # │          │            │ → 失败则现取token3，+offset3 POST             │
+    # ├──────────┼────────────┼──────────────────────────────────────────────┤
+    # │ mode=A   │ burst ★   │ T-pre_fetch_token_ms 预取token1/2/3           │
+    # │          │            │ → T+burst[0] thread-1 直接POST（零GET延迟）   │
+    # │          │            │ → T+burst[1] thread-2 直接POST（零GET延迟）   │
+    # │          │            │ → T+burst[2] thread-3 直接POST（零GET延迟）   │
+    # ├──────────┼────────────┼──────────────────────────────────────────────┤
+    # │ mode=B   │ serial     │ T+first_submit_offset_ms 取token1并POST，等结果│
+    # │ (默认)   │ (默认)     │ → 失败则现取token2，+offset2 POST，等结果      │
+    # │          │            │ → 失败则现取token3，+offset3 POST             │
+    # ├──────────┼────────────┼──────────────────────────────────────────────┤
+    # │ mode=B   │ burst      │ T+burst[0] thread-1 自取token并POST           │
+    # │          │            │ T+burst[1] thread-2 自取token并POST           │
+    # │          │            │ T+burst[2] thread-3 自取token并POST           │
+    # │          │            │ 注意：实际POST = burst[i] + GET网络延迟        │
+    # └──────────┴────────────┴──────────────────────────────────────────────┘
+    _apply_strategy_config(config)
 
     func_dict[args.method](usersdata, args.action)

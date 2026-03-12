@@ -20,6 +20,22 @@ def AES_Encrypt(data):
     return enctext
 
 
+def AES_Decrypt(ciphertext_b64):
+    """AES-CBC 解密，与 AES_Encrypt 配对使用。
+
+    Worker 端用 Web Crypto API 加密后存入 KV，dispatch 传密文到 Actions，
+    main.py 调用此函数解密得到明文密码。
+    """
+    key = b"u2oh6Vu^HWe4_AES"
+    iv = b"u2oh6Vu^HWe4_AES"
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(base64.b64decode(ciphertext_b64)) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded_data) + unpadder.finalize()
+    return plaintext.decode("utf-8")
+
+
 def resort(submit_info):
     return {key: submit_info[key] for key in sorted(submit_info.keys())}
 

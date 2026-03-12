@@ -1,0 +1,25 @@
+{
+  "name": "tongyi-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for multi-user seat reservation management",
+  "main": "src/worker.js",
+  "type": "module",
+  "scripts": {
+    "build": "wrangler build",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "keywords": [
+    "cloudflare",
+    "worker",
+    "seat",
+    "reservation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240605.0",
+    "wrangler": "^4.61.1"
+  }
+}

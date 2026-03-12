@@ -1,6 +1,10 @@
+run-name: >-
+  Reserve -
+  ${{ github.event.client_payload.remark || github.event.client_payload.username || 'manual' }}
+
 on:
   repository_dispatch:
-    types: [cron]
+    types: [reserve]
   workflow_dispatch:        # 允许手动开/关
 
 jobs:
@@ -29,10 +33,15 @@ jobs:
         env:
           CX_USERNAME: ${{ secrets.CX_USERNAME }}
           CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
+          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
           TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}
         run: |
-          python main.py --action
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            python main.py --action --dispatch
+          else
+            python main.py --action
+          fi
 
 
