@@ -60,6 +60,10 @@ def get_date(day_offset: int = 0):
     return offset_day.strftime("%Y-%m-%d")
 
 
+class CredentialRejectedError(RuntimeError):
+    """超星明确拒绝登录凭证时抛出，要求外层立即终止程序。"""
+
+
 class reserve:
     def __init__(
         self,
@@ -305,6 +309,18 @@ class reserve:
             )
             return (False, obj["msg2"])
 
+    @staticmethod
+    def _is_fatal_login_rejection(msg: str) -> bool:
+        msg = str(msg or "")
+        fatal_markers = (
+            "账号密码错误",
+            "密码错误",
+            "用户名或密码错误",
+            "错误输入",
+            "被冻结",
+        )
+        return any(marker in msg for marker in fatal_markers)
+
     def bootstrap_login(self, username, password, attempts=None):
         """建立登录态；遇到短暂网络错误时返回 False，由外层继续调度。"""
         try:
@@ -315,6 +331,10 @@ class reserve:
             return False
 
         if not success:
+            if self._is_fatal_login_rejection(msg):
+                raise CredentialRejectedError(
+                    f"Login rejected for {username}: {msg}"
+                )
             logging.warning(f"Login bootstrap rejected for {username}: {msg}")
             return False
 

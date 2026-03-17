@@ -35,6 +35,7 @@ def _beijing_now() -> datetime.datetime:
 
 
 from utils import AES_Decrypt, reserve, get_user_credentials
+from utils.reserve import CredentialRejectedError
 
 
 def _now(action: bool) -> datetime.datetime:
@@ -1211,4 +1212,8 @@ if __name__ == "__main__":
     # └──────────┴────────────┴──────────────────────────────────────────────┘
     _apply_strategy_config(config)
 
-    func_dict[args.method](usersdata, args.action)
+    try:
+        func_dict[args.method](usersdata, args.action)
+    except CredentialRejectedError as e:
+        logging.error(str(e))
+        raise SystemExit(1) from None
