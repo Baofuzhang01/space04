@@ -8,6 +8,7 @@ import datetime
 import os
 from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
+from requests.adapters import HTTPAdapter
 
 # Load environment variables from .env file
 try:
@@ -65,6 +66,69 @@ class CredentialRejectedError(RuntimeError):
     """超星明确拒绝登录凭证时抛出，要求外层立即终止程序。"""
 
 
+class OfficeTraceHTTPAdapter(HTTPAdapter):
+    """在 send() 层记录 office.chaoxing.com 请求的连接池信息。"""
+
+    def __init__(self, owner, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.owner = owner
+
+    @staticmethod
+    def _snapshot_pool(pool, url: str) -> dict:
+        parsed = urlparse(str(url or ""))
+        return {
+            "pool_key": f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "",
+            "pool_id": hex(id(pool)) if pool is not None else "",
+            "num_connections": getattr(pool, "num_connections", None),
+            "num_requests": getattr(pool, "num_requests", None),
+        }
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        trace_context = getattr(self.owner, "_connection_trace_context", None)
+        should_trace = bool(
+            trace_context and "office.chaoxing.com" in str(getattr(request, "url", ""))
+        )
+
+        before_pool = None
+        before_state = self._snapshot_pool(None, getattr(request, "url", ""))
+        if should_trace:
+            try:
+                before_pool = self.get_connection_with_tls_context(
+                    request, verify, proxies=proxies, cert=cert
+                )
+                before_state = self._snapshot_pool(before_pool, request.url)
+            except Exception as e:
+                before_state["error"] = str(e)
+
+        response = super().send(
+            request,
+            stream=stream,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            proxies=proxies,
+        )
+
+        if should_trace:
+            response_pool = (
+                getattr(response.raw, "_pool", None)
+                or getattr(response.raw, "_connection", None)
+                or before_pool
+            )
+            after_state = self._snapshot_pool(response_pool, request.url)
+            trace = {
+                "kind": trace_context.get("kind", ""),
+                "method": getattr(request, "method", ""),
+                "url": getattr(request, "url", ""),
+                "status_code": getattr(response, "status_code", None),
+                "before": before_state,
+                "after": after_state,
+            }
+            self.owner._record_office_request_trace(trace)
+
+        return response
+
+
 class reserve:
     def __init__(
         self,
@@ -77,17 +141,31 @@ class reserve:
         self.login_page = (
             "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true&fid="
         )
-        # 使用 seatengine 选座页面来获取 submit_enc，与前端行为保持一致
-        # 使用命名占位符，包含 roomId/day/seatPageId/fidEnc 四个参数
-        # 结构与浏览器中实际 URL 对齐：
-        # /front/third/apps/seatengine/select?id=864&day=YYYY-MM-DD&backLevel=2&seatId=602&fidEnc=...
-        self.url = (
-            "https://office.chaoxing.com/front/third/apps/seat/select?"
-            "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
-        )
-        # 使用新版 seatengine 提交接口，与前端保持一致
-        self.submit_url = "https://office.chaoxing.com/data/apps/seat/submit"
-        self.seat_url = "https://office.chaoxing.com/data/apps/seat/getusedtimes"
+        self.api_urls = {
+            "seatengine": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seatengine/select?"
+                    "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seatengine/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seatengine/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seatengine/code",
+            },
+            "seat": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seat/select?"
+                    "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seat/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seat/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seat/code",
+            },
+        }
+        self.api_family = "seatengine"
+        self.url = ""
+        self.submit_url = ""
+        self.seat_url = ""
+        self.code_url = ""
         self.login_url = "https://passport2.chaoxing.com/fanyalogin"
         self.token = ""
         self.success_times = 0
@@ -95,9 +173,15 @@ class reserve:
         self.submit_msg = []
         self.last_submit_result = None
         self.requests = requests.session()
+        self._office_trace_adapter = OfficeTraceHTTPAdapter(self)
+        self.requests.mount("https://office.chaoxing.com/", self._office_trace_adapter)
         self.request_timeout = (
             float(os.getenv("CX_CONNECT_TIMEOUT", "3.05")),
             float(os.getenv("CX_READ_TIMEOUT", "5")),
+        )
+        self.fast_probe_timeout = (
+            float(os.getenv("CX_FAST_PROBE_CONNECT_TIMEOUT", "0.36")),
+            float(os.getenv("CX_FAST_PROBE_READ_TIMEOUT", "0.36")),
         )
         self.request_attempts = max(1, int(os.getenv("CX_REQUEST_ATTEMPTS", "3")))
         self.request_retry_delay = float(os.getenv("CX_REQUEST_RETRY_DELAY", "0.2"))
@@ -135,15 +219,150 @@ class reserve:
         self.enable_slider = enable_slider
         self.enable_textclick = enable_textclick
         self.reserve_next_day = reserve_next_day
+        self._captcha_context = {}
+        self._connection_trace_context = None
+        self._warm_request_trace = {}
+        preferred_family = str(os.getenv("CX_SEAT_API_MODE", "seat")).strip().lower()
+        if preferred_family == "auto":
+            preferred_family = "seatengine"
+        self._set_api_family(preferred_family if preferred_family in self.api_urls else "seatengine")
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    def _set_api_family(self, family: str):
+        family = str(family or "").strip().lower()
+        if family not in self.api_urls:
+            family = "seatengine"
+        urls = self.api_urls[family]
+        self.api_family = family
+        self.url = urls["select"]
+        self.submit_url = urls["submit"]
+        self.seat_url = urls["seat"]
+        self.code_url = urls["code"]
+
+    def _alternate_api_family(self, family: str | None = None) -> str:
+        current = str(family or self.api_family or "seatengine").strip().lower()
+        return "seat" if current == "seatengine" else "seatengine"
+
+    def _build_select_url_for_family(
+        self,
+        family: str,
+        roomid: str,
+        day: str,
+        seat_page_id: str | None,
+        fid_enc: str | None,
+    ) -> str:
+        return self.api_urls[family]["select"].format(
+            roomId=roomid,
+            day=str(day),
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
+
+    def _get_select_url_candidates(self, url: str) -> list[tuple[str, str]]:
+        urls = []
+        current_family = self.api_family
+        raw = str(url or "")
+        if raw:
+            detected = current_family
+            if "/seatengine/" in raw:
+                detected = "seatengine"
+            elif "/apps/seat/" in raw or "/data/apps/seat/" in raw:
+                detected = "seat"
+            urls.append((detected, raw))
+
+        for family in [self.api_family, self._alternate_api_family(self.api_family)]:
+            candidate = self.api_urls[family]["select"]
+            if not any(existing_url == candidate for _, existing_url in urls):
+                urls.append((family, candidate))
+        return urls
+
+    def _submit_with_fallback(self, parm: dict, *, request_name: str):
+        families = [self.api_family, self._alternate_api_family(self.api_family)]
+        tried = set()
+
+        for family in families:
+            submit_url = self.api_urls[family]["submit"]
+            if submit_url in tried:
+                continue
+            tried.add(submit_url)
+            try:
+                response = self._post(
+                    url=submit_url,
+                    data=parm,
+                    verify=False,
+                    request_name=request_name,
+                )
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Seat submit request failed via {family}: {e}")
+                continue
+
+            html = response.content.decode("utf-8")
+            try:
+                data = json.loads(html)
+            except ValueError as e:
+                logging.warning(
+                    f"Failed to parse seat submit response via {family}: {e}; body={html[:200]}"
+                )
+                continue
+
+            if family != self.api_family:
+                logging.info(f"Seat submit fallback switched API family to {family}")
+                self._set_api_family(family)
+            return data
+
+        return None
+
+    def set_captcha_context(
+        self,
+        *,
+        roomid: str | None = None,
+        seat_num: str | None = None,
+        day: str | None = None,
+        seat_page_id: str | None = None,
+        fid_enc: str | None = None,
+    ):
+        self._captcha_context = {
+            "roomid": str(roomid or "").strip(),
+            "seat_num": str(seat_num or "").strip(),
+            "day": str(day or "").strip(),
+            "seat_page_id": str(seat_page_id or "").strip(),
+            "fid_enc": str(fid_enc or "").strip(),
+        }
+
+    def _build_captcha_referer(self):
+        ctx = self._captcha_context or {}
+        roomid = ctx.get("roomid", "")
+        seat_num = ctx.get("seat_num", "")
+        day = ctx.get("day", "")
+        seat_page_id = ctx.get("seat_page_id", "")
+        fid_enc = ctx.get("fid_enc", "")
+
+        params = [("id", roomid), ("seatNum", seat_num)]
+        if day:
+            params.append(("day", day))
+        if seat_page_id:
+            params.append(("seatId", seat_page_id))
+        if fid_enc:
+            params.append(("fidEnc", fid_enc))
+
+        query = "&".join(
+            f"{key}={value}"
+            for key, value in params
+            if value
+        )
+        referer = self.code_url or self.api_urls[self.api_family]["code"]
+        if query:
+            referer = f"{referer}?{query}"
+        logging.debug(f"Using captcha referer: {referer}")
+        return referer
 
     @staticmethod
     def _is_terminal_submit_failure(msg: str) -> bool:
         return "已有预约" in msg or "已被占用" in msg
 
     @staticmethod
-    def _get_token_page_msg(response_url: str = "") -> str:
-        parsed = urlparse(str(response_url or ""))
+    def _get_token_page_msg(url_like: str = "") -> str:
+        parsed = urlparse(str(url_like or ""))
         msg_values = parse_qs(parsed.query).get("msg", [])
         for value in msg_values:
             decoded = unquote(str(value or ""))
@@ -152,12 +371,116 @@ class reserve:
         return ""
 
     @classmethod
-    def _is_token_page_not_open(cls, response_url: str = "") -> bool:
+    def _is_token_page_not_open(
+        cls,
+        response_url: str = "",
+        *,
+        status_code: int | None = None,
+        location: str = "",
+    ) -> bool:
         raw_url = str(response_url or "")
-        msg = cls._get_token_page_msg(raw_url)
+        raw_location = str(location or "")
+        msg = cls._get_token_page_msg(raw_location) or cls._get_token_page_msg(raw_url)
+
+        if status_code in {301, 302, 303, 307, 308} and "当前区域未到开放预约时间" in msg:
+            return True
+
         return (
             "当前区域未到开放预约时间" in msg
+            or "msg=%E5%BD%93%E5%89%8D%E5%8C%BA%E5%9F%9F%E6%9C%AA%E5%88%B0%E5%BC%80%E6%94%BE%E9%A2%84%E7%BA%A6%E6%97%B6%E9%97%B4" in raw_location
             or "msg=%E5%BD%93%E5%89%8D%E5%8C%BA%E5%9F%9F%E6%9C%AA%E5%88%B0%E5%BC%80%E6%94%BE%E9%A2%84%E7%BA%A6%E6%97%B6%E9%97%B4" in raw_url
+        )
+
+    @staticmethod
+    def _extract_submit_enc(html: str) -> str:
+        """从页面 HTML 中提取 submit_enc。"""
+        token_matches = re.findall(
+            r'(?:id|name)\s*=\s*["\']submit_enc["\'][^>]*?value\s*=\s*["\'](.*?)["\']',
+            html or "",
+        )
+        return token_matches[0] if token_matches else ""
+
+    def _record_office_request_trace(self, trace: dict):
+        """记录发送层连接追踪信息。"""
+        kind = str(trace.get("kind", "")).strip()
+        before = trace.get("before", {}) or {}
+        after = trace.get("after", {}) or {}
+
+        if kind == "warm":
+            self._warm_request_trace = trace
+            logging.info(
+                "[warm] 连接追踪：连接池=%s，池对象=%s，发送前连接数=%s，请求数=%s，发送后连接数=%s，请求数=%s，状态码=%s",
+                after.get("pool_key") or before.get("pool_key") or "未知",
+                after.get("pool_id") or before.get("pool_id") or "未知",
+                before.get("num_connections"),
+                before.get("num_requests"),
+                after.get("num_connections"),
+                after.get("num_requests"),
+                trace.get("status_code"),
+            )
+            return
+
+        if kind == "first_fast_probe":
+            logging.info(
+                "第一枪轻探测连接复用：%s",
+                self._describe_first_probe_reuse_from_trace(trace),
+            )
+
+    def _describe_first_probe_reuse_from_trace(self, probe_trace: dict) -> str:
+        """基于发送层 trace 判断第一枪是否复用了预热连接。"""
+        warm_trace = self._warm_request_trace or {}
+        warm_after = warm_trace.get("after", {}) or {}
+        probe_before = probe_trace.get("before", {}) or {}
+        probe_after = probe_trace.get("after", {}) or {}
+
+        pool_key = (
+            probe_after.get("pool_key")
+            or probe_before.get("pool_key")
+            or warm_after.get("pool_key")
+            or "未知"
+        )
+        warm_pool_id = warm_after.get("pool_id") or ""
+        probe_pool_id = probe_after.get("pool_id") or probe_before.get("pool_id") or ""
+        warm_conn = warm_after.get("num_connections")
+        warm_req = warm_after.get("num_requests")
+        probe_before_conn = probe_before.get("num_connections")
+        probe_before_req = probe_before.get("num_requests")
+        probe_after_conn = probe_after.get("num_connections")
+        probe_after_req = probe_after.get("num_requests")
+
+        if warm_pool_id and probe_pool_id and warm_pool_id != probe_pool_id:
+            return (
+                f"连接池={pool_key}，是否复用=否，原因=预热池对象 {warm_pool_id}"
+                f" 与第一枪池对象 {probe_pool_id} 不同；预热后连接数/请求数={warm_conn}/{warm_req}"
+                f"，第一枪发送前={probe_before_conn}/{probe_before_req}，发送后={probe_after_conn}/{probe_after_req}"
+            )
+
+        if all(isinstance(v, int) for v in [warm_conn, warm_req, probe_after_conn, probe_after_req]):
+            if (
+                probe_after_conn == warm_conn
+                and probe_after_req == warm_req + 1
+                and warm_conn >= 1
+            ):
+                return (
+                    f"连接池={pool_key}，是否复用=是，原因=预热后连接数保持 {warm_conn}，"
+                    f"请求数 {warm_req}->{probe_after_req}；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+            if isinstance(probe_before_conn, int) and probe_after_conn > probe_before_conn:
+                return (
+                    f"连接池={pool_key}，是否复用=否，原因=第一枪发送时连接数 {probe_before_conn}->{probe_after_conn}"
+                    f" 增加；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+            if probe_after_conn == warm_conn and probe_after_req > warm_req:
+                return (
+                    f"连接池={pool_key}，是否复用=是，原因=预热后连接数保持 {warm_conn}，"
+                    f"请求数 {warm_req}->{probe_after_req}；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+
+        return (
+            f"连接池={pool_key}，是否复用=未知，原因=发送层计数仍不足以确认；"
+            f"预热后池对象/连接数/请求数={warm_pool_id or '未知'}/{warm_conn}/{warm_req}，"
+            f"第一枪发送前={probe_before_conn}/{probe_before_req}，发送后={probe_after_conn}/{probe_after_req}，"
+            f"第一枪池对象={probe_pool_id or '未知'}"
         )
 
     def should_skip_followup_submit(self) -> bool:
@@ -208,6 +531,59 @@ class reserve:
     def _post(self, url, **kwargs):
         return self._request_with_retry("POST", url, **kwargs)
 
+    def probe_not_open_fast(self, url, *, log_connection_reuse: bool = False):
+        """轻量探测选座页是否仍处于“未开放”状态。
+
+        只发起一次 GET。
+        若最终页面明确是“未开放”，则立即返回并继续下轮探测；
+        若判断为已开放，则直接尝试复用本次响应 HTML 中的 submit_enc。
+
+        返回:
+            {
+                "is_not_open": bool,
+                "token": str,
+                "value": str,
+            }
+        """
+        if log_connection_reuse:
+            self._connection_trace_context = {"kind": "first_fast_probe"}
+        try:
+            response = self._get(
+                url=url,
+                verify=False,
+                allow_redirects=False,
+                timeout=self.fast_probe_timeout,
+                attempts=1,
+                request_name="seat page fast not-open probe",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(
+                f"Fast not-open probe failed for {url}: {e}; "
+                "treat as open and switch to formal token fetch"
+            )
+            return {"is_not_open": False, "token": "", "value": ""}
+        finally:
+            if log_connection_reuse:
+                self._connection_trace_context = None
+
+        response_url = getattr(response, "url", "")
+        status_code = getattr(response, "status_code", None)
+        location = response.headers.get("Location", "")
+        if self._is_token_page_not_open(
+            response_url=response_url,
+            status_code=status_code,
+            location=location,
+        ):
+            response.close()
+            return {"is_not_open": True, "token": "", "value": ""}
+
+        html = response.content.decode("utf-8", errors="ignore")
+        response.close()
+        token = self._extract_submit_enc(html)
+        if token:
+            return {"is_not_open": False, "token": token, "value": token}
+        return {"is_not_open": False, "token": "", "value": ""}
+
     # login and page token
     def _get_page_token(
         self,
@@ -242,84 +618,83 @@ class reserve:
 
         last_response_url = ""
 
-        while True:
-            attempt += 1
-            try:
-                if method.upper() == "POST":
-                    response = self._post(
-                        url=url,
-                        data=data or {},
-                        verify=False,
-                        request_name="seat page token fetch",
-                    )
-                else:
-                    response = self._get(
-                        url=url,
-                        verify=False,
-                        request_name="seat page token fetch",
-                    )
-            except requests.exceptions.RequestException as e:
-                logging.warning(f"Failed to fetch seat page token from {url}: {e}")
-                return "", ""
+        url_candidates = self._get_select_url_candidates(url)
 
-            final_url = getattr(response, "url", "")
-            last_response_url = final_url
-
-            # 统一按 UTF-8 解码，并忽略非法字符，避免 charset 识别错误导致正则匹配失败
-            html = response.content.decode("utf-8", errors="ignore")
-            last_html = html
-
-            # token 在隐藏 input 中，属性顺序和引号类型可能变化，这里做更宽松的匹配
-            # 例如：<input type="hidden" id="submit_enc" value="..."/>
-            # 注意：这里需要匹配 id/name 后面的等号和可选空格
-            token_matches = re.findall(
-                r'(?:id|name)\s*=\s*["\']submit_enc["\'][^>]*?value\s*=\s*["\'](.*?)["\']',
-                html,
-            )
-            if token_matches:
-                token = token_matches[0]
-                # 现在页面没有单独的 algorithm 字段，直接复用 submit_enc
-                algorithm_value = token if require_value else ""
-                if attempt > 1:
-                    logging.info(
-                        f"Get page token from {url} succeeded on retry attempt {attempt}: {token}"
-                    )
-                return token, algorithm_value
-
-            not_open_yet = self._is_token_page_not_open(response_url=final_url)
-            page_msg = self._get_token_page_msg(final_url)
-            if not_open_retry_until is not None:
-                now = (
-                    datetime.datetime.now(not_open_retry_until.tzinfo)
-                    if getattr(not_open_retry_until, "tzinfo", None)
-                    else datetime.datetime.now()
-                )
-                if now < not_open_retry_until:
-                    remaining_s = max(
-                        0.0, (not_open_retry_until - now).total_seconds()
-                    )
-                    sleep_s = min(not_open_retry_interval, remaining_s)
-                    if not_open_yet:
-                        logging.warning(
-                            f"Get page token from {url} hit not-open-yet page on retry "
-                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                            f"(sleep {sleep_s:.3f}s, msg={page_msg})"
+        for candidate_family, candidate_url in url_candidates:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    if method.upper() == "POST":
+                        response = self._post(
+                            url=candidate_url,
+                            data=data or {},
+                            verify=False,
+                            request_name="seat page token fetch",
                         )
                     else:
-                        logging.warning(
-                            f"Get page token from {url} returned no submit_enc on retry "
-                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                            f"(sleep {sleep_s:.3f}s)"
+                        response = self._get(
+                            url=candidate_url,
+                            verify=False,
+                            request_name="seat page token fetch",
                         )
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
-                    continue
-                logging.warning(
-                    f"Get page token from {url} stop refreshing after retry {attempt}: "
-                    f"reached retry deadline {not_open_retry_until}"
-                )
+                except requests.exceptions.RequestException as e:
+                    logging.warning(f"Failed to fetch seat page token from {candidate_url}: {e}")
+                    break
+
+                final_url = getattr(response, "url", "")
+                last_response_url = final_url
+
+                html = response.content.decode("utf-8", errors="ignore")
+                last_html = html
+
+                token = self._extract_submit_enc(html)
+                if token:
+                    algorithm_value = token if require_value else ""
+                    if candidate_family != self.api_family:
+                        logging.info(
+                            f"Get page token fallback switched API family to {candidate_family}"
+                        )
+                        self._set_api_family(candidate_family)
+                    if attempt > 1:
+                        logging.info(
+                            f"Get page token from {candidate_url} succeeded on retry attempt {attempt}: {token}"
+                        )
+                    return token, algorithm_value
+
+                not_open_yet = self._is_token_page_not_open(response_url=final_url)
+                page_msg = self._get_token_page_msg(final_url)
+                if not_open_retry_until is not None:
+                    now = (
+                        datetime.datetime.now(not_open_retry_until.tzinfo)
+                        if getattr(not_open_retry_until, "tzinfo", None)
+                        else datetime.datetime.now()
+                    )
+                    if now < not_open_retry_until:
+                        remaining_s = max(
+                            0.0, (not_open_retry_until - now).total_seconds()
+                        )
+                        sleep_s = min(not_open_retry_interval, remaining_s)
+                        if not_open_yet:
+                            logging.warning(
+                                f"Get page token from {candidate_url} hit not-open-yet page on retry "
+                                f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                                f"(sleep {sleep_s:.3f}s, msg={page_msg})"
+                            )
+                        else:
+                            logging.warning(
+                                f"Get page token from {candidate_url} returned no submit_enc on retry "
+                                f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                                f"(sleep {sleep_s:.3f}s)"
+                            )
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+                        continue
+                    logging.warning(
+                        f"Get page token from {candidate_url} stop refreshing after retry {attempt}: "
+                        f"reached retry deadline {not_open_retry_until}"
+                    )
                 break
-            break
 
         # 取不到 token 时：
         # 1. 控制台打印部分页面内容
@@ -336,12 +711,12 @@ class reserve:
             debug_dir = os.path.join(os.path.dirname(__file__), "..", "html_debug")
             os.makedirs(debug_dir, exist_ok=True)
             ts = int(time.time() * 1000)
-            filename = os.path.join(debug_dir, f"seatengine_{ts}.html")
+            filename = os.path.join(debug_dir, f"{self.api_family}_{ts}.html")
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(last_html)
-            logging.error(f"Full HTML of seatengine page saved to {filename}")
+            logging.error(f"Full HTML of seat page saved to {filename}")
         except Exception as e:
-            logging.warning(f"Failed to save debug HTML for seatengine page: {e}")
+            logging.warning(f"Failed to save debug HTML for seat page: {e}")
         return "", ""
 
     def warm_connection(self, url):
@@ -351,6 +726,7 @@ class reserve:
         requests.Session 底层使用 urllib3 连接池，相同 host 的后续请求可复用已建立的连接，
         跳过 TCP 三次握手 + TLS 协商，节省约 100-200ms。
         """
+        self._connection_trace_context = {"kind": "warm"}
         try:
             logging.info(f"[warm] Start connection pre-warm request via {url}")
             self._get(
@@ -362,6 +738,8 @@ class reserve:
             )
         except Exception:
             pass
+        finally:
+            self._connection_trace_context = None
 
     def get_login_status(self, attempts=None):
         self.requests.headers = self.login_headers
@@ -485,13 +863,12 @@ class reserve:
         """选字验证码求解。"""
         logging.info("Start to resolve textclick captcha token")
         captcha_token, image_url, target_text = self.get_textclick_captcha_data()
-        if not captcha_token or not image_url:
+        if not captcha_token or not image_url or not target_text:
             logging.warning("Failed to get textclick captcha payload")
             return ""
         logging.info(f"Successfully get prepared captcha_token {captcha_token}")
-        logging.info(f"Target text: {target_text}")
+        logging.info(f"Target text raw: {target_text}")
         
-        # 使用颜色分割检测字位置
         positions = self._recognize_textclick_positions(image_url, target_text)
         if not positions:
             logging.warning("Failed to recognize text positions")
@@ -499,9 +876,54 @@ class reserve:
         
         logging.info(f"Successfully recognize positions: {positions}")
         
-        # 尝试控法提交，目前不能100%保证页序正确
-        # 所以放记了目前的应对数序验证，直接提交
         return self._submit_captcha("textclick", captcha_token, positions)
+
+    @staticmethod
+    def _parse_textclick_target_chars(target_text: str):
+        """尽量稳健地从题面里提取需要按顺序点击的文字。"""
+        raw = str(target_text or "").strip()
+        if not raw:
+            return []
+
+        quote_patterns = [
+            r'"([^"]+)"',
+            r"“([^”]+)”",
+            r"‘([^’]+)’",
+            r"「([^」]+)」",
+            r"『([^』]+)』",
+        ]
+        for pattern in quote_patterns:
+            matches = [m.strip() for m in re.findall(pattern, raw) if m and m.strip()]
+            if matches:
+                chars = []
+                for part in matches:
+                    chars.extend([c for c in part if c.strip()])
+                if chars:
+                    return chars
+
+        normalized = raw
+        for phrase in [
+            "请按顺序点击",
+            "请依次点击",
+            "请顺序点击",
+            "依次点击",
+            "顺序点击",
+            "点击",
+            "文字",
+            "汉字",
+            "字符",
+            "下列",
+            "以下",
+            "图中",
+            "图片中",
+            "请点击",
+            ":",
+            "：",
+        ]:
+            normalized = normalized.replace(phrase, " ")
+        normalized = re.sub(r"[\s,，.。;；、\-\[\]\(\)]+", " ", normalized)
+        chars = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", normalized)
+        return chars
 
     def _submit_captcha(self, captcha_type, captcha_token, click_array):
         """统一的验证码提交逻辑。
@@ -542,6 +964,8 @@ class reserve:
             logging.error(f"Failed to parse {captcha_type} captcha response: {e}")
             return ""
         logging.info(f"Successfully resolve the captcha token: {data}")
+        if not data.get("result"):
+            logging.warning(f"{captcha_type} captcha server rejected click array: {click_array}")
         try:
             validate_val = json.loads(data["extraData"])["validate"]
             return validate_val
@@ -554,7 +978,7 @@ class reserve:
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
         timestamp = int(time.time() * 1000)
         capture_key, token = generate_captcha_key(timestamp, captcha_type="textclick")
-        referer = f"https://office.chaoxing.com/front/third/apps/seat/code?id=3993&seatNum=0199"
+        referer = self._build_captcha_referer()
         params = {
             "callback": "jQuery33107685004390294206_1716461324846",
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
@@ -590,10 +1014,13 @@ class reserve:
         captcha_token = data["token"]
         vo = data.get("imageVerificationVo", {})
         
-        # 获取图片 URL 和目标文字
         image_url = vo.get("originImage") or vo.get("shadeImage") or ""
-        # 目标文字格式："\"朝\" \"阳\" \"系\"" 或其他格式
         target_text = vo.get("context") or data.get("clickText") or ""
+        logging.info(
+            "Fetched textclick captcha payload: "
+            f"image_url={'yes' if image_url else 'no'}, "
+            f"target_text={target_text!r}"
+        )
         
         return captcha_token, image_url, target_text
 
@@ -669,13 +1096,14 @@ class reserve:
                 logging.warning("TulingCloud failed to recognize text")
                 return None
             
-            # 处理返回结果（可能是字典或字符串）
             if isinstance(ocr_result, dict):
                 recognized_text = ocr_result.get("text", "")
                 coordinates = ocr_result.get("coordinates")
+                raw_ocr_result = ocr_result.get("raw_result")
             else:
                 recognized_text = ocr_result
                 coordinates = None
+                raw_ocr_result = None
             
             if not recognized_text:
                 logging.warning("TulingCloud returned empty text")
@@ -683,53 +1111,51 @@ class reserve:
             
             logging.info(f"TulingCloud recognized text: {recognized_text}")
             logging.info(f"Target text to find: {target_text}")
+            if raw_ocr_result is not None:
+                logging.debug(f"TulingCloud raw_result: {raw_ocr_result}")
             
             if not coordinates:
                 logging.error(f"TulingCloud did not return coordinates")
                 return None
             
-            # 解析目标文字格式: " "" 业" """ "" 为单个字节）
-            # 例子: '" \u5730" "\u5927" "\u4efb"' -> ['\u5730', '\u5927', '\u4efb']
-            target_chars = []
-            i = 0
-            while i < len(target_text):
-                if target_text[i] == '"':
-                    # 找下一个双引号
-                    j = i + 1
-                    while j < len(target_text) and target_text[j] != '"':
-                        j += 1
-                    if j < len(target_text):
-                        target_chars.append(target_text[i+1:j])
-                        i = j + 1
-                    else:
-                        i += 1
-                else:
-                    i += 1
+            target_chars = self._parse_textclick_target_chars(target_text)
+            if not target_chars:
+                logging.warning(
+                    f"Could not parse target characters from textclick prompt: {target_text!r}"
+                )
+                return None
             
             logging.info(f"Parsed target characters: {target_chars}")
             
-            # 从图灵云的识别结果中找到目标字符的坐标
             result_positions = []
-            used_indices = set()  # 记录已使用的索引，避免重复匹配同一个字符
+            used_indices = set()
             
             for target_char in target_chars:
-                # 在识别的文字中找该字符（跳过已使用的索引）
                 found = False
-                for idx, recognized_char in enumerate(recognized_text):
-                    if recognized_char == target_char and idx < len(coordinates) and idx not in used_indices:
-                        result_positions.append(coordinates[idx])
+                for idx, coord in enumerate(coordinates):
+                    recognized_char = str(coord.get("text") or "")
+                    if (
+                        recognized_char == target_char
+                        and idx not in used_indices
+                        and coord.get("x") is not None
+                        and coord.get("y") is not None
+                    ):
+                        result_positions.append({
+                            "x": int(coord["x"]),
+                            "y": int(coord["y"]),
+                        })
                         used_indices.add(idx)
-                        logging.info(f"Found target '{target_char}' at position {idx}: {coordinates[idx]}")
+                        logging.info(
+                            f"Matched target '{target_char}' with OCR item #{idx}: {coord}"
+                        )
                         found = True
                         break
                 
                 if not found:
-                    # 如果有任何一个目标字符找不到，直接丢弃本次识别结果，返回 None
                     logging.warning(f"Target character '{target_char}' not found in recognized text '{recognized_text}'")
                     logging.warning(f"Discarding this captcha recognition, will retry with new captcha")
                     return None
             
-            # 确保找到了所有目标字符
             if len(result_positions) == len(target_chars):
                 logging.info(f"Final positions for target {target_chars}: {result_positions}")
                 return result_positions
@@ -747,7 +1173,7 @@ class reserve:
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
         timestamp = int(time.time() * 1000)
         capture_key, token = generate_captcha_key(timestamp)
-        referer = f"https://office.chaoxing.com/front/third/apps/seat/code?id=3993&seatNum=0199"
+        referer = self._build_captcha_referer()
         params = {
             "callback": f"jQuery33107685004390294206_1716461324846",
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
@@ -924,6 +1350,13 @@ class reserve:
                     seatPageId=seat_page_id or "",
                     fidEnc=fidEnc or "",
                 )
+                self.set_captcha_context(
+                    roomid=roomid,
+                    seat_num=seat,
+                    day=str(day),
+                    seat_page_id=seat_page_id,
+                    fid_enc=fidEnc,
+                )
                 # seatengine/select 页面在前端是通过 GET 打开的，这里也使用 GET，
                 # 否则可能拿到的是错误页或不包含 submit_enc 的内容。
                 token, value = self._get_page_token(
@@ -990,22 +1423,8 @@ class reserve:
         logging.info(f"submit enc: {parm['enc']}")
 
         # 按前端行为采用表单提交（POST body），并关闭证书验证以避免告警
-        try:
-            response = self._post(
-                url=url,
-                data=parm,
-                verify=False,
-                request_name="seat submit",
-            )
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Seat submit request failed: {e}")
-            return False
-
-        html = response.content.decode("utf-8")
-        try:
-            data = json.loads(html)
-        except ValueError as e:
-            logging.error(f"Failed to parse seat submit response: {e}; body={html[:200]}")
+        data = self._submit_with_fallback(parm, request_name="seat submit")
+        if data is None:
             return False
         self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
@@ -1042,23 +1461,9 @@ class reserve:
         }
         logging.info(f"[burst] submit parameter (before enc) {parm} ")
         parm["enc"] = verify_param(parm, value)
-        try:
-            response = self._post(
-                url=self.submit_url,
-                data=parm,
-                verify=False,
-                request_name="[burst] seat submit",
-            )
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"[burst] Seat submit request failed: {e}")
-            return {"success": False, "msg": str(e)}
-
-        html = response.content.decode("utf-8")
-        try:
-            data = json.loads(html)
-        except ValueError as e:
-            logging.error(f"[burst] Failed to parse seat submit response: {e}; body={html[:200]}")
-            return {"success": False, "msg": "invalid submit response"}
+        data = self._submit_with_fallback(parm, request_name="[burst] seat submit")
+        if data is None:
+            return {"success": False, "msg": "submit request failed on all API families"}
         self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)

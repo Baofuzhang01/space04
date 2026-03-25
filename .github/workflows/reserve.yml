@@ -19,7 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       users_matrix: ${{ steps.build.outputs.users_matrix }}
+      dispatch_target: ${{ steps.meta.outputs.dispatch_target }}
+
     steps:
+      - name: Build dispatch metadata
+        id: meta
+        run: |
+          target="$(jq -r '.client_payload.dispatch_target // "github"' "$GITHUB_EVENT_PATH")"
+          echo "dispatch_target=${target}" >> "$GITHUB_OUTPUT"
+
       - name: Build user matrix from payload
         id: build
         run: |
@@ -28,7 +36,7 @@ jobs:
 
   reserve-dispatch:
     name: reserve-dispatch (${{ matrix.user.nickname || matrix.user.nickName || matrix.user.name || matrix.user.remark || matrix.user.username || '用户' }})
-    if: ${{ github.event_name == 'repository_dispatch' }}
+    if: ${{ github.event_name == 'repository_dispatch' && (needs.prepare-dispatch.outputs.dispatch_target == 'github' || needs.prepare-dispatch.outputs.dispatch_target == 'both') }}
     needs: prepare-dispatch
     runs-on: ubuntu-latest
     strategy:
@@ -75,7 +83,7 @@ jobs:
           out_file="key_logs_${user_name}.txt"
 
           if [[ -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
+            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
           else
             echo "reserve.log not found" > "$out_file"
           fi
@@ -86,7 +94,7 @@ jobs:
           {
             echo "### 用户关键日志 - ${user_name}"
             echo
-            echo "筛选规则：登录、token 获取、验证码、策略发射/结果、提交参数、保存失败、座位递增、dispatch/异常、结束状态"
+            echo "筛选规则：登录、连接预热、token 获取、验证码、策略发射/结果、提交参数、保存失败、座位递增、dispatch/异常、结束状态"
             echo
             echo '```text'
             cat "$out_file"
@@ -116,7 +124,7 @@ jobs:
 
           log_file="key_logs_${USER_NAME}.txt"
           if [[ ! -f "$log_file" && -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
+            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
           fi
 
           if [[ ! -f "$log_file" ]]; then
@@ -132,6 +140,59 @@ jobs:
           status_code="$(curl -sS -o /tmp/feishu_resp.txt -w '%{http_code}' -X POST "$webhook" -H 'Content-Type: application/json' -d "$payload" || true)"
           echo "Feishu response code: ${status_code}"
           cat /tmp/feishu_resp.txt || true
+
+  forward-dispatch:
+    name: forward-dispatch-to-server
+    if: ${{ github.event_name == 'repository_dispatch' && (needs.prepare-dispatch.outputs.dispatch_target == 'server_relay' || needs.prepare-dispatch.outputs.dispatch_target == 'both') }}
+    needs: prepare-dispatch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Forward dispatch payload to server
+        env:
+          SERVER_DISPATCH_URL: ${{ secrets.SERVER_DISPATCH_URL }}
+          SERVER_DISPATCH_API_KEY: ${{ secrets.SERVER_DISPATCH_API_KEY }}
+        run: |
+          if [[ -z "$SERVER_DISPATCH_URL" ]]; then
+            echo "SERVER_DISPATCH_URL secret is required"
+            exit 1
+          fi
+
+          payload="$(jq -c '.client_payload' "$GITHUB_EVENT_PATH")"
+          if [[ -z "$payload" || "$payload" == "null" ]]; then
+            echo "client_payload missing from repository_dispatch event"
+            exit 1
+          fi
+
+          headers=(-H 'Content-Type: application/json')
+          if [[ -n "$SERVER_DISPATCH_API_KEY" ]]; then
+            headers+=(-H "X-API-Key: $SERVER_DISPATCH_API_KEY")
+          fi
+
+          http_code="$(curl -sS -o /tmp/server_dispatch_resp.txt -w '%{http_code}' \
+            -X POST "$SERVER_DISPATCH_URL" \
+            "${headers[@]}" \
+            --data "$payload")"
+
+          echo "Server dispatch HTTP status: ${http_code}"
+          echo "===== Server dispatch response ====="
+          cat /tmp/server_dispatch_resp.txt || true
+
+          {
+            echo "### 服务器中转结果"
+            echo
+            echo "- Dispatch URL: ${SERVER_DISPATCH_URL}"
+            echo "- HTTP Status: ${http_code}"
+            echo
+            echo '```json'
+            cat /tmp/server_dispatch_resp.txt
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! "$http_code" =~ ^2 ]]; then
+            exit 1
+          fi
 
   reserve-manual:
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -196,7 +257,7 @@ jobs:
           out_file="key_logs_${user_name}.txt"
 
           if [[ -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
+            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
           else
             echo "reserve.log not found" > "$out_file"
           fi
@@ -207,7 +268,7 @@ jobs:
           {
             echo "### 用户关键日志 - ${user_name}"
             echo
-            echo "筛选规则：登录、token 获取、验证码、策略发射/结果、提交参数、保存失败、座位递增、dispatch/异常、结束状态"
+            echo "筛选规则：登录、连接预热、token 获取、验证码、策略发射/结果、提交参数、保存失败、座位递增、dispatch/异常、结束状态"
             echo
             echo '```text'
             cat "$out_file"
@@ -237,7 +298,7 @@ jobs:
 
           log_file="key_logs_${USER_NAME}.txt"
           if [[ ! -f "$log_file" && -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
+            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
           fi
 
           if [[ ! -f "$log_file" ]]; then
@@ -253,5 +314,3 @@ jobs:
           status_code="$(curl -sS -o /tmp/feishu_resp.txt -w '%{http_code}' -X POST "$webhook" -H 'Content-Type: application/json' -d "$payload" || true)"
           echo "Feishu response code: ${status_code}"
           cat /tmp/feishu_resp.txt || true
-
-
