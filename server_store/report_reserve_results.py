@@ -334,8 +334,8 @@ def extract_submit_attempts(log_text: str) -> list[dict]:
                 attempts.append(current)
             continue
 
-        stripped = line.strip()
-        if current is not None and "'success'" in stripped:
+        stripped = strip_log_prefix(line)
+        if current is not None and stripped.startswith("{") and "'success'" in stripped:
             result = parse_literal_dict(stripped)
             if result is not None:
                 current["result"] = result
