@@ -58,11 +58,11 @@ def _get_chaojiying_config():
     return username, password, soft_id, int(codetype or 9800)
 
 
-def _get_tulingcloud_config():
-    """从环境变量或 config.json 获取图灵云配置，作为超级鹰不可用时的备用。"""
+def _get_tulingcloud_config(model_id_env: str = "TULINGCLOUD_MODEL_ID"):
+    """从环境变量或 config.json 获取图灵云配置。"""
     username = os.getenv("TULINGCLOUD_USERNAME", "")
     password = os.getenv("TULINGCLOUD_PASSWORD", "")
-    model_id = os.getenv("TULINGCLOUD_MODEL_ID", "")
+    model_id = os.getenv(model_id_env, "")
 
     if not all([username, password, model_id]):
         try:
@@ -73,6 +73,8 @@ def _get_tulingcloud_config():
                     tuling_config = config.get("tulingcloud", {})
                     username = username or tuling_config.get("username", "")
                     password = password or tuling_config.get("password", "")
+                    if model_id_env == "TULINGCLOUD_SPIN_MODEL_ID":
+                        model_id = model_id or tuling_config.get("spin_model_id", "")
                     model_id = model_id or tuling_config.get("model_id", "")
         except Exception as e:
             logging.debug(f"Failed to read tulingcloud config from config.json: {e}")
@@ -180,6 +182,7 @@ class reserve:
         max_attempt=50,
         enable_slider=False,
         enable_textclick=False,
+        enable_rotate=False,
         reserve_next_day=False,
         reserve_day_offset=None,
     ):
@@ -271,6 +274,7 @@ class reserve:
         self.max_attempt = max_attempt
         self.enable_slider = enable_slider
         self.enable_textclick = enable_textclick
+        self.enable_rotate = enable_rotate
         self.reserve_next_day = reserve_next_day
         self.reserve_day_offset = reserve_day_offset
         self._captcha_context = {}
@@ -934,12 +938,14 @@ class reserve:
         """统一的验证码求解入口。
         
         参数:
-            captcha_type: "slide"（滑块）或 "textclick"（选字）
+            captcha_type: "slide"（滑块）、"textclick"（选字）或 "rotate"（旋转滑块）
         """
         if captcha_type == "slide":
             return self._resolve_slide_captcha()
         elif captcha_type == "textclick":
             return self._resolve_textclick_captcha()
+        elif captcha_type == "rotate":
+            return self._resolve_rotate_captcha_with_retry(max_attempts=3)
         else:
             logging.error(f"Unknown captcha type: {captcha_type}")
             return ""
@@ -1017,6 +1023,47 @@ class reserve:
                 )
         logging.error(
             f"Textclick captcha token remains empty after {attempts} attempts, skip submit to avoid empty captcha"
+        )
+        return ""
+
+    def _resolve_rotate_captcha(self):
+        """旋转滑块验证码求解。"""
+        logging.info("Start to resolve rotate captcha token")
+        captcha_token, captcha_iv, shade_url, cutout_url = self.get_rotate_captcha_data()
+        if not captcha_token or not captcha_iv or not shade_url or not cutout_url:
+            logging.warning("Failed to get rotate captcha payload")
+            return ""
+
+        solve = self._recognize_rotate_x(shade_url, cutout_url)
+        if not solve:
+            logging.warning("Rotate captcha recognition failed before submit")
+            return ""
+
+        x = solve["x"]
+        logging.info(
+            "Successfully recognize rotate captcha: angle=%s, x=%s",
+            solve["angle"],
+            x,
+        )
+        return self._submit_rotate_captcha(captcha_token, captcha_iv, x)
+
+    def _resolve_rotate_captcha_with_retry(self, max_attempts: int = 2):
+        """图灵云识别失败时不提交当前验证码，直接重新取一组 rotate。"""
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            captcha = self._resolve_rotate_captcha()
+            if captcha:
+                if attempt > 1:
+                    logging.info(
+                        f"Rotate captcha token resolved on retry attempt {attempt}/{attempts}"
+                    )
+                return captcha
+            if attempt < attempts:
+                logging.warning(
+                    f"Rotate captcha token is empty on attempt {attempt}/{attempts}, fetch a new captcha"
+                )
+        logging.error(
+            f"Rotate captcha token remains empty after {attempts} attempts, skip submit"
         )
         return ""
 
@@ -1212,6 +1259,56 @@ class reserve:
             logging.info("Can't load validate value. Maybe server return mistake.")
             return ""
 
+    def _submit_rotate_captcha(self, captcha_token, captcha_iv, x):
+        params = {
+            "callback": "cx_captcha_function",
+            "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
+            "type": "rotate",
+            "token": captcha_token,
+            "textClickArr": json.dumps(
+                [{"x": max(0, min(278, int(x)))}],
+                separators=(",", ":"),
+            ),
+            "coordinate": json.dumps([]),
+            "runEnv": "10",
+            "version": "1.1.20",
+            "t": "a",
+            "iv": captcha_iv,
+            "_": int(time.time() * 1000),
+        }
+        try:
+            response = self._get(
+                "https://captcha.chaoxing.com/captcha/check/verification/result",
+                params=params,
+                headers=self.headers,
+                request_name="rotate captcha submit",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to submit rotate captcha: {e}")
+            return ""
+
+        text = response.text.strip()
+        if text.startswith("cx_captcha_function("):
+            text = text[len("cx_captcha_function("):]
+            if text.endswith(")"):
+                text = text[:-1]
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            logging.error(f"Failed to parse rotate captcha response: {e}")
+            return ""
+
+        logging.info(f"Successfully resolve the rotate captcha token: {data}")
+        if not data.get("result"):
+            logging.warning("Rotate captcha server rejected x=%s", x)
+            return ""
+
+        try:
+            return json.loads(data["extraData"])["validate"]
+        except (KeyError, ValueError, TypeError):
+            logging.info("Can't load rotate validate value. Maybe server return mistake.")
+            return ""
+
     def get_textclick_captcha_data(self):
         """获取选字验证码数据。"""
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
@@ -1262,6 +1359,121 @@ class reserve:
         )
         
         return captcha_token, image_url, target_text
+
+    def get_rotate_captcha_data(self):
+        """获取 rotate 验证码数据：token、iv、小圆图、背景挖空图。"""
+        url = "https://captcha.chaoxing.com/captcha/get/verification/image"
+        timestamp = int(time.time() * 1000)
+        capture_key, token = generate_captcha_key(timestamp, captcha_type="rotate")
+        referer = self._build_captcha_referer()
+        params = {
+            "callback": "cx_captcha_function",
+            "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
+            "type": "rotate",
+            "version": "1.1.20",
+            "captchaKey": capture_key,
+            "token": token,
+            "referer": referer,
+            "_": timestamp,
+            "d": "a",
+            "b": "a",
+        }
+        try:
+            response = self._get(
+                url=url,
+                params=params,
+                headers=self.headers,
+                request_name="rotate captcha fetch",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch rotate captcha data: {e}")
+            return "", "", "", ""
+
+        text = response.text.strip()
+        if text.startswith("cx_captcha_function("):
+            text = text[len("cx_captcha_function("):]
+            if text.endswith(")"):
+                text = text[:-1]
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            logging.error(f"Failed to parse rotate captcha payload: {e}")
+            return "", "", "", ""
+
+        vo = data.get("imageVerificationVo", {})
+        captcha_token = data.get("token") or ""
+        captcha_iv = data.get("iv") or vo.get("iv") or ""
+        shade_url = vo.get("shadeImage") or vo.get("borderImage") or ""
+        cutout_url = vo.get("cutoutImage") or vo.get("templateImage") or ""
+        logging.info(
+            "Fetched rotate captcha payload: token=%s, iv=%s, shade=%s, cutout=%s",
+            bool(captcha_token),
+            bool(captcha_iv),
+            bool(shade_url),
+            bool(cutout_url),
+        )
+        return captcha_token, captcha_iv, shade_url, cutout_url
+
+    def _recognize_rotate_x(self, shade_url, cutout_url):
+        c_captcha_headers = {
+            "Referer": "https://office.chaoxing.com/",
+            "Host": "captcha-b.chaoxing.com",
+            "User-Agent": self.headers["User-Agent"],
+        }
+
+        def _download(url: str, label: str):
+            try:
+                resp = self._get(
+                    url,
+                    headers=c_captcha_headers,
+                    timeout=5,
+                    attempts=3,
+                    request_name=f"rotate {label} image download",
+                )
+                resp.raise_for_status()
+                return resp.content
+            except Exception as e:
+                logging.warning("Failed to download rotate %s image: %s", label, e)
+                return None
+
+        shade_bytes = _download(shade_url, "shade")
+        cutout_bytes = _download(cutout_url, "cutout")
+        if not shade_bytes or not cutout_bytes:
+            return None
+
+        if _should_save_captcha_debug_images():
+            try:
+                ts = int(time.time() * 1000)
+                debug_dir = os.path.join(os.path.dirname(__file__), "..", "captcha_debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                shade_path = os.path.join(debug_dir, f"rotate_shade_{ts}.jpg")
+                cutout_path = os.path.join(debug_dir, f"rotate_cutout_{ts}.jpg")
+                with open(shade_path, "wb") as f:
+                    f.write(shade_bytes)
+                with open(cutout_path, "wb") as f:
+                    f.write(cutout_bytes)
+                logging.debug("Saved rotate captcha images to %s and %s", shade_path, cutout_path)
+            except Exception as e:
+                logging.debug("Failed to save rotate captcha images: %s", e)
+
+        try:
+            from utils.tulingcloud_ocr import TulingCloudOCR
+
+            username, password, model_id = _get_tulingcloud_config(
+                model_id_env="TULINGCLOUD_SPIN_MODEL_ID"
+            )
+            if not all([username, password, model_id]):
+                logging.error(
+                    "Set TULINGCLOUD_USERNAME, TULINGCLOUD_PASSWORD, "
+                    "TULINGCLOUD_SPIN_MODEL_ID in env or config.json"
+                )
+                return None
+
+            ocr = TulingCloudOCR(username=username, password=password, model_id=model_id)
+            return ocr.solve_rotate_x(shade_bytes, cutout_bytes)
+        except Exception as e:
+            logging.debug("Rotate OCR failed: %s", e)
+            return None
 
     def _recognize_textclick_positions(self, image_url, target_text):
         """识别选字验证码中的文字位置。
@@ -1870,7 +2082,17 @@ class reserve:
                     break
                 # 根据开关决定使用哪种验证码（两种验证码可以同时开启）
                 captcha = ""
-                if self.enable_slider:
+                if self.enable_rotate:
+                    captcha = self._resolve_rotate_captcha_with_retry(max_attempts=3)
+                    logging.info(f"Rotate captcha token: {captcha}")
+                    if not captcha:
+                        logging.warning(
+                            "Skip current submit because rotate captcha is still empty after retry"
+                        )
+                        time.sleep(self.sleep_time)
+                        self.max_attempt -= 1
+                        continue
+                elif self.enable_slider:
                     captcha = self._resolve_slide_captcha_with_retry(max_attempts=3)
                     logging.info(f"Slider captcha token: {captcha}")
                     if not captcha:

@@ -4,10 +4,13 @@
 """
 
 import base64
+import io
 import json
 import logging
 import re
 from typing import Optional
+
+from PIL import Image, ImageDraw
 
 
 class TulingCloudOCR:
@@ -27,6 +30,53 @@ class TulingCloudOCR:
         self.username = username
         self.password = password
         self.model_id = model_id
+
+    @staticmethod
+    def clamp_rotate_x(x: int, slider_max_x: int = 278) -> int:
+        return max(0, min(slider_max_x, int(x)))
+
+    @classmethod
+    def rotate_angle_to_x(
+        cls,
+        angle: float,
+        *,
+        slider_max_x: int = 278,
+        angle_scale: int = 500,
+    ) -> int:
+        return cls.clamp_rotate_x(
+            round(float(angle) * slider_max_x / angle_scale),
+            slider_max_x=slider_max_x,
+        )
+
+    @staticmethod
+    def _circle_mask(size: tuple[int, int], inset: int = 17) -> Image.Image:
+        w, h = size
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((inset, inset, w - inset, h - inset), fill=255)
+        return mask
+
+    @classmethod
+    def compose_rotate_image(
+        cls,
+        shade_bytes: bytes,
+        cutout_bytes: bytes,
+        *,
+        jpeg_quality: int = 95,
+    ) -> bytes:
+        """合成图灵云 rotate 模型需要的单张 RGB JPEG。"""
+        shade = Image.open(io.BytesIO(shade_bytes)).convert("RGBA")
+        cutout = Image.open(io.BytesIO(cutout_bytes)).convert("RGBA")
+
+        if shade.size != cutout.size:
+            shade = shade.resize(cutout.size, Image.Resampling.BICUBIC)
+
+        merged = cutout.copy()
+        merged.paste(shade, (0, 0), cls._circle_mask(cutout.size))
+
+        out = io.BytesIO()
+        merged.convert("RGB").save(out, format="JPEG", quality=jpeg_quality)
+        return out.getvalue()
     
     def recognize_textclick(self, img_data: bytes) -> Optional[dict]:
         """
@@ -138,6 +188,70 @@ class TulingCloudOCR:
             import traceback
             logging.debug(traceback.format_exc())
             return None
+
+    def recognize_rotate_angle(self, image_bytes: bytes) -> Optional[float]:
+        """识别超星 rotate 验证码，返回“小圆顺时针旋转度数”。"""
+        try:
+            import requests
+
+            payload = {
+                "username": self.username,
+                "password": self.password,
+                "ID": self.model_id,
+                "b64": base64.b64encode(image_bytes).decode("ascii"),
+                "version": "3.1.1",
+            }
+            response = requests.post(
+                self.TULINGCLOUD_API_URL,
+                data=json.dumps(payload),
+                timeout=15,
+            )
+            result = response.json()
+            logging.debug("TulingCloud rotate API response: %s", result)
+        except Exception as e:
+            logging.debug("TulingCloud rotate recognition request failed: %s", e)
+            return None
+
+        if result.get("code") not in {0, 1}:
+            logging.debug(
+                "TulingCloud rotate recognition failed: code=%s message=%s",
+                result.get("code"),
+                result.get("message") or result.get("msg"),
+            )
+            return None
+
+        data = result.get("data") or {}
+        angle = data.get("小圆顺时针旋转度数")
+        if angle is None:
+            logging.debug("TulingCloud rotate response has no angle field: %s", result)
+            return None
+
+        try:
+            return float(angle)
+        except (TypeError, ValueError):
+            logging.debug("TulingCloud rotate angle is not numeric: %r", angle)
+            return None
+
+    def solve_rotate_x(
+        self,
+        shade_bytes: bytes,
+        cutout_bytes: bytes,
+    ) -> Optional[dict]:
+        """两图合成 -> 图灵云识别 -> 计算超星 rotate x。"""
+        try:
+            composed_image = self.compose_rotate_image(shade_bytes, cutout_bytes)
+        except Exception as e:
+            logging.debug("Failed to compose rotate captcha image: %s", e)
+            return None
+
+        angle = self.recognize_rotate_angle(composed_image)
+        if angle is None:
+            return None
+
+        return {
+            "angle": angle,
+            "x": self.rotate_angle_to_x(angle),
+        }
     
     @staticmethod
     def query_balance(username: str, password: str) -> Optional[float]:

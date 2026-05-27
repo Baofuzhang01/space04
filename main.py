@@ -223,6 +223,7 @@ RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 RESERVE_DAY_OFFSET = None  # 可选：覆盖提交参数 day 的北京时间日期偏移，2 表示后天
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（默认使用超级鹰打码平台）
+ENABLE_ROTATE = False  # 是否有旋转滑块验证码（使用图灵云 rotate 模型）
 SEAT_API_MODE = "seat"  # 选座接口模式：auto / seatengine / seat
 
 FAST_PROBE_START_OFFSET_MS = 14  # 目标时间后多少毫秒开始轻探测
@@ -312,6 +313,7 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "reserve_day_offset": payload.get("reserve_day_offset"),
             "enable_slider": payload.get("enable_slider", ENABLE_SLIDER),
             "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
+            "enable_rotate": payload.get("enable_rotate", ENABLE_ROTATE),
             "relogin_every_loop": False,
         }
 
@@ -340,6 +342,7 @@ def _apply_strategy_config(config):
     global RESERVE_NEXT_DAY
     global ENABLE_SLIDER
     global ENABLE_TEXTCLICK
+    global ENABLE_ROTATE
     global STRATEGY_LOGIN_LEAD_SECONDS
     global STRATEGY_SLIDER_LEAD_SECONDS
     global STRATEGIC_MODE
@@ -361,6 +364,7 @@ def _apply_strategy_config(config):
     RESERVE_DAY_OFFSET = normalize_day_offset(config.get("reserve_day_offset", None))
     ENABLE_SLIDER = bool(config.get("enable_slider", ENABLE_SLIDER))
     ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
+    ENABLE_ROTATE = bool(config.get("enable_rotate", ENABLE_ROTATE))
     seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
     SEAT_API_MODE = (
         seat_api_mode if seat_api_mode in {"auto", "seatengine", "seat"} else "auto"
@@ -610,7 +614,7 @@ def _burst_shot_worker(
         f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
     )
 
-    if (ENABLE_SLIDER or ENABLE_TEXTCLICK) and not captcha:
+    if (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK) and not captcha:
         logging.error(
             f"[burst] Shot {index + 1} has empty captcha, skip submit to avoid empty captcha"
         )
@@ -828,6 +832,7 @@ def strategic_first_attempt(
                 max_attempt=MAX_ATTEMPT,
                 enable_slider=ENABLE_SLIDER,
                 enable_textclick=ENABLE_TEXTCLICK,
+                enable_rotate=ENABLE_ROTATE,
                 reserve_next_day=RESERVE_NEXT_DAY,
                 reserve_day_offset=RESERVE_DAY_OFFSET,
             )
@@ -883,15 +888,17 @@ def strategic_first_attempt(
                 return (captcha_deadline - _beijing_now()).total_seconds()
 
             # 2. 等到“目标时间前若干秒”，预热滑块验证码，提前拿到多份 validate（如果启用了滑块）
-            if ENABLE_SLIDER or ENABLE_TEXTCLICK:
+            if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK:
                 ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
                 _wait_until(ten_before)
 
-            if ENABLE_SLIDER:
-                def _resolve_slide_captcha_parallel(slot_idx: int) -> str:
+            if ENABLE_ROTATE or ENABLE_SLIDER:
+                active_captcha_type = "rotate" if ENABLE_ROTATE else "slide"
+
+                def _resolve_image_captcha_parallel(slot_idx: int) -> str:
                     if _remaining_captcha_seconds() <= 0:
                         logging.warning(
-                            f"[strategic] Slider captcha{slot_idx} skipped: preheat deadline reached"
+                            f"[strategic] {active_captcha_type} captcha{slot_idx} skipped: preheat deadline reached"
                         )
                         return ""
 
@@ -900,6 +907,7 @@ def strategic_first_attempt(
                         max_attempt=MAX_ATTEMPT,
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
+                        enable_rotate=ENABLE_ROTATE,
                         reserve_next_day=RESERVE_NEXT_DAY,
                         reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
@@ -913,30 +921,32 @@ def strategic_first_attempt(
                         fid_enc=fid_enc,
                     )
 
-                    captcha = worker.resolve_captcha("slide")
+                    captcha = worker.resolve_captcha(active_captcha_type)
                     if not captcha:
                         if _remaining_captcha_seconds() <= 0:
                             logging.warning(
-                                f"[strategic] Slider captcha{slot_idx} retry skipped: preheat deadline reached"
+                                f"[strategic] {active_captcha_type} captcha{slot_idx} retry skipped: preheat deadline reached"
                             )
                             return ""
                         logging.warning(
-                            f"[strategic] Slider captcha{slot_idx} failed or empty, retrying once more"
+                            f"[strategic] {active_captcha_type} captcha{slot_idx} failed or empty, retrying once more"
                         )
-                        captcha = worker.resolve_captcha("slide")
+                        captcha = worker.resolve_captcha(active_captcha_type)
                     return captcha
 
                 captcha_results = {1: "", 2: "", 3: ""}
                 live_captcha_results = captcha_results
                 remaining = _remaining_captcha_seconds()
                 if remaining <= 0:
-                    logging.warning("[strategic] Captcha preheat budget exhausted before slider starts, skip preheat")
+                    logging.warning(
+                        f"[strategic] Captcha preheat budget exhausted before {active_captcha_type} starts, skip preheat"
+                    )
                 else:
                     def _worker(slot_idx: int):
                         try:
-                            captcha_results[slot_idx] = _resolve_slide_captcha_parallel(slot_idx) or ""
+                            captcha_results[slot_idx] = _resolve_image_captcha_parallel(slot_idx) or ""
                         except Exception as e:
-                            logging.warning(f"[strategic] Slider captcha{slot_idx} thread failed: {e}")
+                            logging.warning(f"[strategic] {active_captcha_type} captcha{slot_idx} thread failed: {e}")
                             captcha_results[slot_idx] = ""
 
                     deadline_mono = time.monotonic() + remaining
@@ -947,7 +957,7 @@ def strategic_first_attempt(
                             t = threading.Thread(
                                 target=_worker,
                                 args=(idx,),
-                                name=f"slide-captcha-{idx}",
+                                name=f"{active_captcha_type}-captcha-{idx}",
                                 daemon=True,
                             )
                             local_threads.append((idx, t))
@@ -988,9 +998,9 @@ def strategic_first_attempt(
                 captcha1 = captcha_results[1]
                 captcha2 = captcha_results[2]
                 captcha3 = captcha_results[3]
-                logging.info(f"[strategic] Pre-resolved slider captcha1: {captcha1}")
-                logging.info(f"[strategic] Pre-resolved slider captcha2: {captcha2}")
-                logging.info(f"[strategic] Pre-resolved slider captcha3: {captcha3}")
+                logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha1: {captcha1}")
+                logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha2: {captcha2}")
+                logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha3: {captcha3}")
             elif ENABLE_TEXTCLICK:
                 captcha_results = {1: "", 2: "", 3: ""}
                 live_captcha_results = captcha_results
@@ -1004,6 +1014,7 @@ def strategic_first_attempt(
                             max_attempt=MAX_ATTEMPT,
                             enable_slider=ENABLE_SLIDER,
                             enable_textclick=ENABLE_TEXTCLICK,
+                            enable_rotate=ENABLE_ROTATE,
                             reserve_next_day=RESERVE_NEXT_DAY,
                             reserve_day_offset=RESERVE_DAY_OFFSET,
                         )
@@ -1066,13 +1077,14 @@ def strategic_first_attempt(
                 f"[strategic] Reuse preheated session from {shared_strategy_username} for {username}; "
                 "skip login and captcha preheat"
             )
-            if ENABLE_SLIDER:
+            if ENABLE_ROTATE or ENABLE_SLIDER:
+                active_captcha_type = "rotate" if ENABLE_ROTATE else "slide"
                 logging.info(
-                    "[strategic] Captcha preheat skipped for this config; resolve slide captchas on demand"
+                    f"[strategic] Captcha preheat skipped for this config; resolve {active_captcha_type} captchas on demand"
                 )
-                captcha1 = s.resolve_captcha("slide") or ""
-                captcha2 = s.resolve_captcha("slide") or ""
-                captcha3 = s.resolve_captcha("slide") or ""
+                captcha1 = s.resolve_captcha(active_captcha_type) or ""
+                captcha2 = s.resolve_captcha(active_captcha_type) or ""
+                captcha3 = s.resolve_captcha(active_captcha_type) or ""
             elif ENABLE_TEXTCLICK:
                 logging.info(
                     "[strategic] Captcha preheat skipped for this config; resolve one textclick captcha first"
@@ -1085,8 +1097,8 @@ def strategic_first_attempt(
                 captcha2 = ""
                 captcha3 = ""
 
-        captcha_required = bool(ENABLE_SLIDER or ENABLE_TEXTCLICK)
-        captcha_type = "slide" if ENABLE_SLIDER else "textclick"
+        captcha_required = bool(ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+        captcha_type = "rotate" if ENABLE_ROTATE else ("slide" if ENABLE_SLIDER else "textclick")
         raw_captchas = [captcha1, captcha2, captcha3]
         if ENABLE_TEXTCLICK and captcha1:
             captchas_for_submit = [captcha1, captcha1, captcha1]
@@ -1966,7 +1978,7 @@ def login_and_reserve(
     users, usernames, passwords, action, success_list=None, sessions=None
 ):
     logging.info(
-        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
+        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
     )
 
     usernames_list, passwords_list = None, None
@@ -2034,6 +2046,7 @@ def login_and_reserve(
                         max_attempt=MAX_ATTEMPT,
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
+                        enable_rotate=ENABLE_ROTATE,
                         reserve_next_day=RESERVE_NEXT_DAY,
                         reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
@@ -2053,6 +2066,7 @@ def login_and_reserve(
                     max_attempt=MAX_ATTEMPT,
                     enable_slider=ENABLE_SLIDER,
                     enable_textclick=ENABLE_TEXTCLICK,
+                    enable_rotate=ENABLE_ROTATE,
                     reserve_next_day=RESERVE_NEXT_DAY,
                     reserve_day_offset=RESERVE_DAY_OFFSET,
                 )
@@ -2231,7 +2245,7 @@ def main(users, action=False):
 
 def debug(users, action=False):
     logging.info(
-        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
+        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
     )
     suc = False
     logging.info(f" Debug Mode start! , action {'on' if action else 'off'}")
@@ -2289,6 +2303,7 @@ def debug(users, action=False):
             max_attempt=MAX_ATTEMPT,
             enable_slider=ENABLE_SLIDER,
             enable_textclick=ENABLE_TEXTCLICK,
+            enable_rotate=ENABLE_ROTATE,
             reserve_next_day=RESERVE_NEXT_DAY,
             reserve_day_offset=RESERVE_DAY_OFFSET,
         )
@@ -2318,6 +2333,7 @@ def get_roomid(args1, args2):
         max_attempt=MAX_ATTEMPT,
         enable_slider=ENABLE_SLIDER,
         enable_textclick=ENABLE_TEXTCLICK,
+        enable_rotate=ENABLE_ROTATE,
         reserve_next_day=RESERVE_NEXT_DAY,
         reserve_day_offset=RESERVE_DAY_OFFSET,
     )
