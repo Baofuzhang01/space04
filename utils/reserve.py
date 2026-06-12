@@ -7,7 +7,7 @@ import logging
 import datetime
 import os
 import threading
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
@@ -323,6 +323,21 @@ class reserve:
             fidEnc=fid_enc or "",
         )
 
+    def build_token_url(
+        self,
+        roomid: str,
+        day: str,
+        seat_page_id: str | None,
+        fid_enc: str | None,
+        seat_num: str | None = None,
+    ) -> str:
+        params = {
+            "id": str(roomid),
+            "seatNum": str(seat_num or ""),
+            "fidEnc": str(fid_enc or ""),
+        }
+        return f"{self.api_urls['seat']['code']}?{urlencode(params)}"
+
     def _get_select_url_candidates(self, url: str) -> list[tuple[str, str]]:
         urls = []
         current_family = self.api_family
@@ -334,6 +349,8 @@ class reserve:
             elif "/apps/seat/" in raw or "/data/apps/seat/" in raw:
                 detected = "seat"
             urls.append((detected, raw))
+            if "/code?" in raw:
+                return urls
 
         for family in [self.api_family, self._alternate_api_family(self.api_family)]:
             candidate = self.api_urls[family]["select"]
@@ -2178,12 +2195,13 @@ class reserve:
                         )
                         return suc
 
-                # 使用 seatengine/select 页面获取 submit_enc，相当于手动刷新选座页
-                page_url = self.url.format(
-                    roomId=slot_roomid,
-                    day=request_day,
-                    seatPageId=slot_page_id or "",
-                    fidEnc=slot_fid_enc or "",
+                # 构造当前座位对应的页面 URL，并从页面获取 submit_enc。
+                page_url = self.build_token_url(
+                    slot_roomid,
+                    request_day,
+                    slot_page_id,
+                    slot_fid_enc,
+                    seat,
                 )
                 self.set_captcha_context(
                     roomid=slot_roomid,

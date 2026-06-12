@@ -977,11 +977,12 @@ def strategic_first_attempt(
                 milliseconds=WARM_CONNECTION_LEAD_MS
             )
             first_token_start_dt = _get_first_token_start_dt(target_dt)
-            early_warm_url = s.url.format(
-                roomId=roomid,
-                day=warm_day,
-                seatPageId=seat_page_id or "",
-                fidEnc=fid_enc or "",
+            early_warm_url = s.build_token_url(
+                roomid,
+                warm_day,
+                seat_page_id,
+                fid_enc,
+                first_seat,
             )
 
             # 某些学校把页面预热配置在验证码之前；按配置时间顺序真正先执行预热。
@@ -1571,24 +1572,27 @@ def strategic_first_attempt(
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        _first_token_url = s.url.format(
-            roomId=roomid,
-            day=first_token_day,
-            seatPageId=seat_page_id or "",
-            fidEnc=fid_enc or "",
+        _first_token_url = s.build_token_url(
+            roomid,
+            first_token_day,
+            seat_page_id,
+            fid_enc,
+            first_seat,
         )
         # 预热仍使用当天页面；响应内容和其中的页面 token 永远丢弃。
-        _warm_url = s.url.format(
-            roomId=roomid,
-            day=warm_day,
-            seatPageId=seat_page_id or "",
-            fidEnc=fid_enc or "",
+        _warm_url = s.build_token_url(
+            roomid,
+            warm_day,
+            seat_page_id,
+            fid_enc,
+            first_seat,
         )
-        _submit_token_url = s.url.format(
-            roomId=roomid,
-            day=submit_day,
-            seatPageId=seat_page_id or "",
-            fidEnc=fid_enc or "",
+        _submit_token_url = s.build_token_url(
+            roomid,
+            submit_day,
+            seat_page_id,
+            fid_enc,
+            first_seat,
         )
 
         def _maybe_switch_to_backup(handle, token, value, label: str, shot_no: int):
@@ -1647,12 +1651,17 @@ def strategic_first_attempt(
                     backup_room,
                     backup_seat,
                 )
-                if backup_room != roomid or str(backup_page_id or "") != str(seat_page_id or ""):
-                    backup_token_url = s.url.format(
-                        roomId=backup_room,
-                        day=submit_day,
-                        seatPageId=backup_page_id or "",
-                        fidEnc=backup_fid or "",
+                if (
+                    backup_room != roomid
+                    or str(backup_page_id or "") != str(seat_page_id or "")
+                    or str(backup_seat) != str(first_seat)
+                ):
+                    backup_token_url = s.build_token_url(
+                        backup_room,
+                        submit_day,
+                        backup_page_id,
+                        backup_fid,
+                        backup_seat,
                     )
                     backup_token, backup_value = s._get_page_token(
                         backup_token_url,
@@ -1726,12 +1735,17 @@ def strategic_first_attempt(
                     fallback_seat,
                     offset,
                 )
-                if fallback_base_room != roomid or str(fallback_page_id or "") != str(seat_page_id or ""):
-                    fallback_token_url = s.url.format(
-                        roomId=fallback_base_room,
-                        day=submit_day,
-                        seatPageId=fallback_page_id or "",
-                        fidEnc=fallback_fid or "",
+                if (
+                    fallback_base_room != roomid
+                    or str(fallback_page_id or "") != str(seat_page_id or "")
+                    or str(fallback_seat) != str(first_seat)
+                ):
+                    fallback_token_url = s.build_token_url(
+                        fallback_base_room,
+                        submit_day,
+                        fallback_page_id,
+                        fallback_fid,
+                        fallback_seat,
                     )
                     fallback_token, fallback_value = s._get_page_token(
                         fallback_token_url,
@@ -1822,11 +1836,12 @@ def strategic_first_attempt(
                 "first burst submit",
                 1,
             )
-            burst_token_url = s.url.format(
-                roomId=burst_room,
-                day=submit_day,
-                seatPageId=burst_page_id or burst_room,
-                fidEnc=burst_fid or "",
+            burst_token_url = s.build_token_url(
+                burst_room,
+                submit_day,
+                burst_page_id or burst_room,
+                burst_fid,
+                burst_seat,
             )
             token_submit_lock = threading.Lock()
             logging.info(
@@ -1885,11 +1900,12 @@ def strategic_first_attempt(
                 serial_target_seat = submit_seat
                 serial_target_page_id = submit_page_id
                 serial_target_fid = submit_fid
-                serial_target_token_url = s.url.format(
-                    roomId=submit_room,
-                    day=submit_day,
-                    seatPageId=submit_page_id or submit_room,
-                    fidEnc=submit_fid or "",
+                serial_target_token_url = s.build_token_url(
+                    submit_room,
+                    submit_day,
+                    submit_page_id or submit_room,
+                    submit_fid,
+                    submit_seat,
                 )
 
             if skip_first_strategic_submit:
