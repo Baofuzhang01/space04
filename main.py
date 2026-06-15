@@ -209,6 +209,25 @@ def _pick_ordered_fallback_seat(
     return formatted_seat, formatted_offset
 
 
+def _pick_next_ordered_fallback_seat(
+    base_seat_num: int,
+    start_attempt_no: int,
+    used_seats: set[str] | None = None,
+) -> tuple[str | None, str, int]:
+    """从指定轮次开始，跳过无效/已用座位，返回下一个可尝试的有序补位。"""
+    for attempt_no in range(
+        max(1, start_attempt_no), MAX_SEAT_INCREMENT_ATTEMPTS + 1
+    ):
+        seat, offset = _pick_ordered_fallback_seat(
+            base_seat_num,
+            attempt_no,
+            used_seats,
+        )
+        if seat:
+            return seat, offset, attempt_no
+    return None, "", max(1, start_attempt_no)
+
+
 def _normalize_backup_slots(raw_slots) -> list[dict]:
     if isinstance(raw_slots, str):
         result = []
@@ -619,9 +638,10 @@ def _probe_then_get_page_token(
             return probe_token, probe_value
 
         logging.info(
-            f"[strategic] 快速探测第 {probe_attempt} 次：判定页面已开放但未复用到 token；"
+            f"[strategic] 快速探测第 {probe_attempt} 次：未识别到未开放提示，"
+            "但本次响应未提取到 token；"
             f"探测时间 {probe_checked_dt}，距目标时刻 {elapsed_ms:.1f}ms，"
-            "切换到正式取 token"
+            f"诊断={probe_result.get('diagnostic', {})}，切换到正式取 token"
         )
         break
 
@@ -724,6 +744,7 @@ def strategic_first_attempt(
     target_dt: datetime.datetime,
     success_list=None,
     sessions=None,
+    fallback_used_seats=None,
 ):
     """只在第一次调用时使用的“有策略抢座”。
 
@@ -735,6 +756,8 @@ def strategic_first_attempt(
     """
     if success_list is None:
         success_list = [False] * len(users)
+    if fallback_used_seats is None or len(fallback_used_seats) != len(users):
+        fallback_used_seats = [set() for _ in users]
 
     now = _beijing_now()
     # 如果已经过了目标时间，直接退回到普通逻辑由外层处理
@@ -1696,7 +1719,16 @@ def strategic_first_attempt(
             except (TypeError, ValueError):
                 base_seat_num = 0
             for attempt_no in range(max(1, shot_no), MAX_SEAT_INCREMENT_ATTEMPTS + 1):
-                fallback_seat, offset = _pick_ordered_fallback_seat(base_seat_num, attempt_no)
+                used_for_config = (
+                    fallback_used_seats[index]
+                    if index < len(fallback_used_seats)
+                    else None
+                )
+                fallback_seat, offset = _pick_ordered_fallback_seat(
+                    base_seat_num,
+                    attempt_no,
+                    used_for_config,
+                )
                 fallback_key = (fallback_base_room, fallback_seat or "")
                 if not fallback_seat:
                     continue
@@ -1723,8 +1755,10 @@ def strategic_first_attempt(
                             fallback_base_room,
                             fallback_seat,
                         )
-                        continue
+                    continue
                 claimed_backup_seats.add(fallback_key)
+                if used_for_config is not None:
+                    used_for_config.add(fallback_seat)
                 logging.info(
                     "[strategic] %s primary seat %s/%s conflicted and %s, use ordered fallback from %s/%s -> %s/%s (%s)",
                     label,
@@ -2397,7 +2431,14 @@ def main(users, action=False):
 
         if not strategic_done:
             success_list = strategic_first_attempt(
-                users, usernames, passwords, action, target_dt, success_list, sessions
+                users,
+                usernames,
+                passwords,
+                action,
+                target_dt,
+                success_list,
+                sessions,
+                fallback_used_seats,
             )
             strategic_done = True
 
@@ -2407,7 +2448,7 @@ def main(users, action=False):
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, offset = _pick_ordered_fallback_seat(
+                        new_seat, offset, _ = _pick_next_ordered_fallback_seat(
                             original_seatids[i],
                             seat_increment_attempts,
                             fallback_used_seats[i],
@@ -2415,7 +2456,7 @@ def main(users, action=False):
                         if not new_seat:
                             logging.info(
                                 f"[seat-ordered-after-strategic] Config {i}: skip invalid/used fallback "
-                                f"(base {original_seatids[i]}, offset {offset}, "
+                                f"(base {original_seatids[i]}, offset {offset or 'none'}, "
                                 f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                             )
                             continue
@@ -2452,7 +2493,7 @@ def main(users, action=False):
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, offset = _pick_ordered_fallback_seat(
+                        new_seat, offset, _ = _pick_next_ordered_fallback_seat(
                             original_seatids[i],
                             seat_increment_attempts,
                             fallback_used_seats[i],
@@ -2460,7 +2501,7 @@ def main(users, action=False):
                         if not new_seat:
                             logging.info(
                                 f"[seat-ordered] Config {i}: skip invalid/used fallback "
-                                f"(base {original_seatids[i]}, offset {offset}, "
+                                f"(base {original_seatids[i]}, offset {offset or 'none'}, "
                                 f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                             )
                             continue

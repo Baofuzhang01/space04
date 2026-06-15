@@ -223,7 +223,10 @@ def iter_today_run_dirs(runs_dir: pathlib.Path, today: dt.date | None = None) ->
         if not entry.is_dir():
             continue
         summary_path = entry / "summary.json"
-        if not summary_path.exists():
+        payload_path = entry / "payload.json"
+        if not summary_path.exists() and not payload_path.exists():
+            continue
+        if not summary_path.exists() and not any(entry.rglob("*.log")):
             continue
         run_dt = parse_run_dir_datetime(entry.name)
         if run_dt is not None:
@@ -231,7 +234,8 @@ def iter_today_run_dirs(runs_dir: pathlib.Path, today: dt.date | None = None) ->
                 items.append(entry)
             continue
         try:
-            mtime = dt.datetime.fromtimestamp(summary_path.stat().st_mtime, BEIJING_TZ)
+            timestamp_path = summary_path if summary_path.exists() else payload_path
+            mtime = dt.datetime.fromtimestamp(timestamp_path.stat().st_mtime, BEIJING_TZ)
         except Exception:
             continue
         if mtime.date() == target_day:
@@ -241,10 +245,11 @@ def iter_today_run_dirs(runs_dir: pathlib.Path, today: dt.date | None = None) ->
 
 
 def user_by_index(payload: dict, index: int) -> dict:
-    users = payload.get("users")
-    if isinstance(users, list) and 1 <= index <= len(users):
-        user = users[index - 1]
-        return user if isinstance(user, dict) else {}
+    for key in ("users", "reserve"):
+        users = payload.get(key)
+        if isinstance(users, list) and 1 <= index <= len(users):
+            user = users[index - 1]
+            return user if isinstance(user, dict) else {}
     return payload if isinstance(payload, dict) else {}
 
 
@@ -595,7 +600,17 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     account_masked = mask_account(account)
     returncode = int(item.get("returncode") if item.get("returncode") is not None else 0)
 
-    nickname = normalize_text(user.get("nickname") or user.get("nickName") or user.get("remark") or user.get("name"), 120)
+    nickname = normalize_text(
+        user.get("nickname")
+        or user.get("nickName")
+        or user.get("remark")
+        or user.get("name")
+        or item.get("nickname")
+        or item.get("nickName")
+        or item.get("remark")
+        or item.get("name"),
+        120,
+    )
     attempt_results: list[dict] = []
     for attempt in attempts:
         slot = match_user_slot(user_slots, attempt)
@@ -762,6 +777,7 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
         "user_id": user_id,
         "account": account,
         "account_masked": account_masked,
+        "nickname": nickname,
         "reserve_date": reserve_date,
         "status": status,
         "error_code": error_code,
@@ -841,11 +857,58 @@ def write_results_to_local_db(results: list[dict]) -> dict:
     return {"ok": True, "accepted": accepted, "mode": "local-db"}
 
 
+def fallback_summary_results(run_dir: pathlib.Path, payload: dict) -> list[dict]:
+    users = payload.get("users")
+    if not isinstance(users, list):
+        users = payload.get("reserve")
+    if not isinstance(users, list):
+        users = [payload] if payload else []
+
+    log_paths = sorted(path for path in run_dir.rglob("*.log") if path.is_file())
+    if not log_paths:
+        return []
+    results: list[dict] = []
+    for index, user in enumerate(users, start=1):
+        if not isinstance(user, dict):
+            continue
+        account = normalize_text(user.get("phone") or user.get("username"), 120)
+        matching_logs = [
+            path
+            for path in log_paths
+            if account and account in path.name
+        ]
+        if matching_logs:
+            log_path = matching_logs[0]
+        elif len(log_paths) == 1:
+            log_path = log_paths[0]
+        elif index <= len(log_paths):
+            log_path = log_paths[index - 1]
+        else:
+            log_path = run_dir / f"user_{index}.log"
+        results.append(
+            {
+                "index": index,
+                "username": account,
+                "log_path": str(log_path),
+                "returncode": 1,
+            }
+        )
+    return results
+
+
 def process_run(run_dir: pathlib.Path, server_id: str) -> tuple[list[dict], dict]:
     summary = load_json(run_dir / "summary.json", {})
     payload = load_json(run_dir / "payload.json", {})
+    summary_items = summary.get("results")
+    if not isinstance(summary_items, list) or not summary_items:
+        summary_items = fallback_summary_results(run_dir, payload)
+        summary = {
+            **summary,
+            "run_id": summary.get("run_id") or run_dir.name,
+            "results": summary_items,
+        }
     results = []
-    for item in summary.get("results") or []:
+    for item in summary_items:
         if isinstance(item, dict):
             results.append(build_result(run_dir, summary, payload, item, server_id))
     processed = {

@@ -7,7 +7,7 @@ import logging
 import datetime
 import os
 import threading
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
@@ -741,10 +741,32 @@ class reserve:
     def _post(self, url, **kwargs):
         return self._request_with_retry("POST", url, **kwargs)
 
+    @staticmethod
+    def _fast_probe_diagnostic(response, html: str = "", *, followed_redirect: bool = False) -> dict:
+        headers = getattr(response, "headers", {}) or {}
+        normalized_preview = re.sub(r"\s+", " ", html or "").strip()
+        normalized_preview = re.sub(
+            r"[A-Za-z0-9_./%+=-]{24,}",
+            "<redacted>",
+            normalized_preview,
+        )
+        return {
+            "status_code": getattr(response, "status_code", None),
+            "response_url": str(getattr(response, "url", "") or ""),
+            "location": str(headers.get("Location", "") or ""),
+            "content_type": str(headers.get("Content-Type", "") or ""),
+            "content_length_header": str(headers.get("Content-Length", "") or ""),
+            "body_length": len(html or ""),
+            "contains_submit_enc_text": "submit_enc" in (html or ""),
+            "followed_redirect": followed_redirect,
+            "body_preview": normalized_preview[:180],
+        }
+
     def probe_not_open_fast(self, url, *, log_connection_reuse: bool = False):
         """轻量探测选座页是否仍处于“未开放”状态。
 
-        只发起一次 GET。
+        首次 GET 禁止自动跳转，以便快速识别“未开放”重定向。
+        若是其他有效重定向，则只跟随一次并尝试从最终页面复用 submit_enc。
         若最终页面明确是“未开放”，则立即返回并继续下轮探测；
         若判断为已开放，则直接尝试复用本次响应 HTML 中的 submit_enc。
 
@@ -771,7 +793,12 @@ class reserve:
                 f"Fast not-open probe failed for {url}: {e}; "
                 "treat as open and switch to formal token fetch"
             )
-            return {"is_not_open": False, "token": "", "value": ""}
+            return {
+                "is_not_open": False,
+                "token": "",
+                "value": "",
+                "diagnostic": {"request_error": str(e)},
+            }
         finally:
             if log_connection_reuse:
                 self._connection_trace_context = None
@@ -787,12 +814,64 @@ class reserve:
             response.close()
             return {"is_not_open": True, "token": "", "value": ""}
 
+        is_redirect = status_code in {301, 302, 303, 307, 308} and bool(location)
+        followed_redirect = False
+        if is_redirect:
+            redirect_url = urljoin(response_url or url, location)
+            response.close()
+            followed_redirect = True
+            try:
+                response = self._get(
+                    url=redirect_url,
+                    verify=False,
+                    allow_redirects=True,
+                    timeout=self.fast_probe_timeout,
+                    attempts=1,
+                    request_name="seat page fast redirect token probe",
+                )
+            except requests.exceptions.RequestException as e:
+                logging.warning(
+                    f"Fast token redirect follow failed for {redirect_url}: {e}; "
+                    "switch to formal token fetch"
+                )
+                return {
+                    "is_not_open": False,
+                    "token": "",
+                    "value": "",
+                    "diagnostic": {
+                        "redirect_url": redirect_url,
+                        "redirect_error": str(e),
+                        "followed_redirect": True,
+                    },
+                }
+
+            response_url = getattr(response, "url", "")
+            status_code = getattr(response, "status_code", None)
+            location = response.headers.get("Location", "")
+            if self._is_token_page_not_open(
+                response_url=response_url,
+                status_code=status_code,
+                location=location,
+            ):
+                response.close()
+                return {"is_not_open": True, "token": "", "value": ""}
+
         html = response.content.decode("utf-8", errors="ignore")
+        diagnostic = self._fast_probe_diagnostic(
+            response,
+            html,
+            followed_redirect=followed_redirect,
+        )
         response.close()
         token = self._extract_submit_enc(html)
         if token:
             return {"is_not_open": False, "token": token, "value": token}
-        return {"is_not_open": False, "token": "", "value": ""}
+        return {
+            "is_not_open": False,
+            "token": "",
+            "value": "",
+            "diagnostic": diagnostic,
+        }
 
     # login and page token
     def _get_page_token(

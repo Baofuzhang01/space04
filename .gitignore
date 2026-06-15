@@ -189,6 +189,7 @@ pageexe.zip
 qianduan/
 server_runs/
 server_worker2_watchdog/
+sign/
 server_store/
 !server_store/
 server_store/*
